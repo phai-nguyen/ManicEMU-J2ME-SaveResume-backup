@@ -1,0 +1,102 @@
+name: iOS unsigned build
+
+on:
+  push:
+    branches:
+      - feature/j2me-auto-save-resume
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build Manic EMU for iOS
+    runs-on: macos-26
+    timeout-minutes: 90
+
+    steps:
+      - name: Check out source, submodules, and Git LFS assets
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          lfs: true
+          fetch-depth: 0
+
+      - name: Pull Git LFS objects
+        run: |
+          git lfs install
+          git lfs pull
+          git submodule update --init --recursive
+
+      - name: Install native build dependencies
+        run: |
+          brew install boost molten-vk vulkan-headers vulkan-loader glslang spirv-tools
+          echo "VULKAN_SDK=$(brew --prefix)" >> "$GITHUB_ENV"
+
+      - name: Show Xcode version and available schemes
+        run: |
+          xcodebuild -version
+          xcodebuild -list -project ManicEmu/ManicEmu.xcodeproj
+
+      - name: Resolve Swift packages
+        run: |
+          xcodebuild \
+            -resolvePackageDependencies \
+            -project ManicEmu/ManicEmu.xcodeproj \
+            -scheme ManicEmuSideload
+
+      - name: Build unsigned iOS app
+        shell: bash
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project ManicEmu/ManicEmu.xcodeproj \
+            -scheme ManicEmuSideload \
+            -configuration SideloadRelease \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$RUNNER_TEMP/ManicEMU-DerivedData" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build | tee "$RUNNER_TEMP/xcodebuild.log"
+
+      - name: Package unsigned IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+          PRODUCTS="$RUNNER_TEMP/ManicEMU-DerivedData/Build/Products/SideloadRelease-iphoneos"
+          APP="$PRODUCTS/ManicEmuSideload.app"
+
+          if [ ! -d "$APP" ]; then
+            echo "Expected app bundle not found: $APP"
+            find "$RUNNER_TEMP/ManicEMU-DerivedData/Build/Products" -maxdepth 3 -name '*.app' -print || true
+            exit 1
+          fi
+
+          PACKAGE="$RUNNER_TEMP/ipa-package"
+          mkdir -p "$PACKAGE/Payload"
+          ditto "$APP" "$PACKAGE/Payload/ManicEmuSideload.app"
+          (cd "$PACKAGE" && /usr/bin/zip -qry "$GITHUB_WORKSPACE/ManicEMU-J2ME-unsigned.ipa" Payload)
+
+      - name: Upload unsigned IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: ManicEMU-J2ME-unsigned-ipa
+          path: ManicEMU-J2ME-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ManicEMU-xcodebuild-log
+          path: ${{ runner.temp }}/xcodebuild.log
+          if-no-files-found: ignore
+          retention-days: 14
