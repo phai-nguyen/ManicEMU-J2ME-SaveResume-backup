@@ -1485,6 +1485,9 @@ extension PlayViewController {
             didPause = true
         } else if manicGame.isJ2MECore {
             j2meCore?.pause()
+            j2meCore?.save(to: manicGame.gameSaveUrl.path) { success in
+                Log.debug(success ? "✅ J2ME RMS saved on pause" : "⚠️ J2ME RMS save on pause failed")
+            }
             didPause = true
         } else if manicGame.isRuffleCore {
             ruffleCore?.pause()
@@ -3306,9 +3309,21 @@ extension PlayViewController {
                 self.dismiss(animated: true)
             }
         } else if manicGame.isJ2MECore {
-            gameMetalView = nil
-            DispatchQueue.main.asyncAfter(delay: 0.5) {
-                self.dismiss(animated: true)
+            let finish = { [weak self] in
+                guard let self else { return }
+                self.gameMetalView = nil
+                DispatchQueue.main.asyncAfter(delay: 0.5) {
+                    self.dismiss(animated: true)
+                }
+            }
+            if let j2meCore {
+                j2meCore.pause()
+                j2meCore.save(to: manicGame.gameSaveUrl.path) { success in
+                    Log.debug(success ? "✅ J2ME RMS saved before exit" : "⚠️ J2ME RMS save before exit failed")
+                    DispatchQueue.main.async { finish() }
+                }
+            } else {
+                finish()
             }
         } else if manicGame.isRuffleCore {
             let finish = { [weak self] in
