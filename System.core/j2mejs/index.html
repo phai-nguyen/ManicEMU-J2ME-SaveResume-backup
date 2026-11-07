@@ -469,36 +469,58 @@
       setTimeout(function() { _waitForEngineReady(callback); }, 100);
     }
 
-    function _openJar(bytes, fileName, screenSize, rotation) {
-      if (!(bytes instanceof Uint8Array)) {
-        if (bytes instanceof ArrayBuffer) bytes = new Uint8Array(bytes);
-        else { console.error('openJar: invalid input'); return; }
-      }
+    function _openJar(bytes, fileName, screenSize, rotation, saveDataB64) {
+      return new Promise(function(resolve, reject) {
+        if (!(bytes instanceof Uint8Array)) {
+          if (bytes instanceof ArrayBuffer) bytes = new Uint8Array(bytes);
+          else { reject(new Error('openJar: invalid input')); return; }
+        }
 
-      _waitForEngineReady(function() {
-        JARStore.addBuiltIn(fileName, bytes.buffer, false);
-        config.jars = fileName;
+        _waitForEngineReady(function() {
+          try {
+            JARStore.addBuiltIn(fileName, bytes.buffer, false);
+            config.jars = fileName;
 
-        // 若 Swift 传入了目标尺寸则在 JVM 启动前应用，否则保持默认（240x320）
-        if (screenSize) {
-          var parts = String(screenSize).trim().split(/[x,*]/);
-          if (parts.length === 2) {
-            var w = parseInt(parts[0], 10), h = parseInt(parts[1], 10);
-            if (w > 0 && h > 0) _setScreenSize(w, h);
+            // Import RMS before the JVM starts. The MIDlet can otherwise create
+            // an empty RecordStore before the saved records reach IndexedDB.
+            var launchMIDlet = function() {
+              try {
+                if (screenSize) {
+                  var parts = String(screenSize).trim().split(/[x,*]/);
+                  if (parts.length === 2) {
+                    var w = parseInt(parts[0], 10), h = parseInt(parts[1], 10);
+                    if (w > 0 && h > 0) _setScreenSize(w, h);
+                  }
+                }
+
+                if (rotation) _setRotation(true);
+                if (typeof hideDownloadScreen === 'function') hideDownloadScreen();
+
+                var jvmInstance = typeof jvm !== 'undefined' ? jvm : new JVM();
+                setTimeout(function() {
+                  try {
+                    jvmInstance.startIsolate0(config.main, config.args);
+                    resolve(true);
+                  } catch (error) {
+                    reject(error);
+                  }
+                }, 500);
+              } catch (error) {
+                reject(error);
+              }
+            };
+
+            var restore = saveDataB64 ? _loadSaveData(saveDataB64) : Promise.resolve(true);
+            restore.then(function() {
+              launchMIDlet();
+            }).catch(function(error) {
+              console.error('[iOS] RMS restore failed; MIDlet launch cancelled:', error);
+              reject(error);
+            });
+          } catch (error) {
+            reject(error);
           }
-        }
-
-        // 旋转：交换宽高并设置 CSS transform
-        if (rotation) {
-          _setRotation(true);
-        }
-
-        if (typeof hideDownloadScreen === 'function') hideDownloadScreen();
-
-        var jvmInstance = typeof jvm !== 'undefined' ? jvm : new JVM();
-        setTimeout(function() {
-          jvmInstance.startIsolate0(config.main, config.args);
-        }, 500);
+        });
       });
     }
 
@@ -508,7 +530,8 @@
         return r.arrayBuffer();
       }).then(function(buf) {
         _openJar(new Uint8Array(buf), fileName || 'game.jar');
-      }).catch(function(e) { console.error('Failed to fetch JAR:', e); });
+      }).then(function(bytes) { return _openJar(bytes, fileName || 'game.jar'); })
+        .catch(function(e) { console.error('Failed to fetch or launch JAR:', e); });
     }
 
     function _setScreenSize(w, h) {
@@ -571,14 +594,28 @@
     }
 
     function _loadSaveData(b64) {
-      if (typeof SaveManager === 'undefined' || typeof JSZip === 'undefined') return;
-      try {
-        var raw = atob(b64), bytes = new Uint8Array(raw.length);
-        for (var i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
-        SaveManager.importSaveFromZip(new Blob([bytes], { type: 'application/zip' }), function(ok) {
-          console.log('loadSaveData:', ok ? 'OK' : 'FAIL');
-        });
-      } catch(e) { console.error('loadSaveData error:', e); }
+      return new Promise(function(resolve, reject) {
+        if (!b64) { resolve(true); return; }
+        if (typeof SaveManager === 'undefined' || typeof JSZip === 'undefined') {
+          reject(new Error('SaveManager is not ready'));
+          return;
+        }
+        try {
+          var raw = atob(b64), bytes = new Uint8Array(raw.length);
+          for (var i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
+          var zip = new Blob([bytes], { type: 'application/zip' });
+          SaveManager.importSaveFromZip(zip, function(ok) {
+            if (ok === false) {
+              reject(new Error('SaveManager.importSaveFromZip returned false'));
+            } else {
+              console.log('[iOS] J2ME RMS restore completed');
+              resolve(true);
+            }
+          });
+        } catch(e) {
+          reject(e);
+        }
+      });
     }
 
     // Save state format: JSON { version: 1, saveData: <zip_b64>, screen: <png_b64> }
