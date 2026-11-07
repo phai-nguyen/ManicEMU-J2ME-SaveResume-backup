@@ -487,11 +487,16 @@ class J2MEView: BaseView {
         let script: String
         switch coreType {
         case .j2meJS:
-            // j2meJS: load save separately before openJar (different engine, no CheerpJ conflict)
-            if let savePath, FileManager.default.fileExists(atPath: savePath) {
-                loadSave(path: savePath)
+            // Restore RMS before the JVM starts. Starting the MIDlet before the
+            // IndexedDB import finishes can make the game see an empty RecordStore.
+            let saveBase64: String?
+            if let savePath, FileManager.default.fileExists(atPath: savePath),
+               let data = try? Data(contentsOf: URL(fileURLWithPath: savePath)) {
+                saveBase64 = data.base64EncodedString()
+            } else {
+                saveBase64 = nil
             }
-            script = buildJ2meJSLoadScript(jarURL: jarURL, fileName: fileName, screenSize: screenSize, rotation: rotation)
+            script = buildJ2meJSLoadScript(jarURL: jarURL, fileName: fileName, saveBase64: saveBase64, screenSize: screenSize, rotation: rotation)
         case .freej2meWeb:
             // freej2meWeb: pass save data into openJar so it's restored BEFORE FreeJ2ME.main()
             // is called — CheerpJ rejects importData() while Java code is already running.
@@ -822,11 +827,11 @@ class J2MEView: BaseView {
     
     // MARK: - Private Helpers
     
-    private func buildJ2meJSLoadScript(jarURL: String, fileName: String, screenSize: J2MESize, rotation: Bool) -> String {
-        // Pass screen size as third arg to _openJar so canvas is sized before startApp() runs.
-        // JS accepts "WxH" string or null.
+    private func buildJ2meJSLoadScript(jarURL: String, fileName: String, saveBase64: String?, screenSize: J2MESize, rotation: Bool) -> String {
+        // J2meJS imports RMS data before starting the JVM.
         let sizeArg = "'\(screenSize.width)x\(screenSize.height)'"
         let rotationArg = rotation ? "true" : "false"
+        let saveArg = saveBase64.map { "'\($0)'" } ?? "null"
         return """
         (async () => {
             try {
@@ -843,7 +848,7 @@ class J2MEView: BaseView {
                 console.log('📦 JAR size:', bytes.length, 'bytes');
         
                 if (window.j2me && window.j2me.openJar) {
-                    window.j2me.openJar(bytes, '\(fileName)', \(sizeArg), \(rotationArg));
+                    await window.j2me.openJar(bytes, '\(fileName)', \(sizeArg), \(rotationArg), \(saveArg));
                     console.log('✅ JAR loaded successfully');
                     try { window.webkit.messageHandlers.j2me.postMessage({ type: 'openJarCompletion', success: true }); } catch(e) {}
                 } else {
@@ -953,8 +958,8 @@ extension J2MEView: WKScriptMessageHandler {
             let base64String = body["base64"] as? String
             if let b64 = base64String, !b64.isEmpty, let data = Data(base64Encoded: b64) {
                 do {
-                    try data.write(to: URL(fileURLWithPath: path))
-                    Log.debug("✅ Save data written to: \(path)")
+                    try data.write(to: URL(fileURLWithPath: path), options: .atomic)
+                    Log.debug("✅ Save data written atomically to: \(path)")
                     comp?(true)
                 } catch {
                     Log.debug("❌ Write save data failed: \(error)")
@@ -970,8 +975,12 @@ extension J2MEView: WKScriptMessageHandler {
             if let base64Data = body["data"] as? String,
                let data = Data(base64Encoded: base64Data),
                let savePath {
-                try? data.write(to: URL(fileURLWithPath: savePath))
-                Log.debug("✅ Auto-save updated")
+                do {
+                    try data.write(to: URL(fileURLWithPath: savePath), options: .atomic)
+                    Log.debug("✅ Auto-save updated atomically")
+                } catch {
+                    Log.debug("❌ Auto-save write failed: \(error)")
+                }
             }
             
         case "exportSaveStateComplete":
